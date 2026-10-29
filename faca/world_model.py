@@ -1,0 +1,898 @@
+import json
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+from . import layers, math, init
+from .observation_contract import uses_state_goal, policy_state_dim, split_state_goal_observation
+from .models.axial_task_encoder import AxialTaskEncoder
+from .models.contact_history_encoder import ContactHistoryEncoder
+from .models.execution_history_encoder import ExecutionHistoryEncoder
+from .models.faca_factorized import AlignmentHead, BeliefEncoder, ContactEvidenceEncoder, ContactModeHead
+from .models.latent_residual import TaskConditionedLatentContactResidualAdapter
+from .models.task_context_adapter import TaskContextFiLMAdapter
+from tensordict import TensorDict
+
+
+class WorldModel(nn.Module):
+	"""
+	TD-MPC2 implicit world model architecture.
+	Can be used for both single-task and multi-task experiments.
+	"""
+
+	def __init__(self, cfg):
+		super().__init__()
+		self.cfg = cfg
+		self._faca_variant = str(cfg.get('faca_variant', 'none')).strip().lower()
+		self._factorized_faca = self._faca_variant in {'m2', 'm3'}
+		if self._faca_variant in {'m0', 'm1', 'm2', 'm3'}:
+			obs_shape = cfg.get('obs_shape', None)
+			state_shape = None if obs_shape is None else obs_shape.get('state', None)
+			state_dim = None if state_shape is None else int(state_shape[0])
+			expected_state_dim = 14 if self._faca_variant == 'm0' else (
+				int(cfg.get('faca_history_state_dim', 14)) +
+				int(cfg.get('faca_history_force_dim', 6))
+			)
+			if uses_state_goal(cfg):
+				expected_state_dim = 17
+			if state_dim != expected_state_dim:
+				raise ValueError(
+					f"FACA {self._faca_variant.upper()} requires an exact {expected_state_dim}D "
+					f"runtime observation, got obs_shape={obs_shape}."
+				)
+		self._multitask = cfg.num_global_tasks is not None and cfg.num_global_tasks > 1
+		self._task_emb = None
+		self._task_encoder = None
+		self._contact_encoder = None
+		self._execution_history_encoder = None
+		self._contact_evidence_encoder = None
+		self._alignment_head = None
+		self._contact_mode_head = None
+		self._task_context_adapters = None
+		self._latent_residual_adapter = None
+		self._latent_residual_enabled = bool(cfg.get('latent_residual_enabled', False))
+		self._task_context_adapter_enabled = bool(cfg.get('task_context_adapter_enabled', False))
+		self._task_context_adapter_source = str(cfg.get('task_context_adapter_source', 'task_context')).lower()
+		self._contact_context_dim = 0
+		self._task_vec_normalization_enabled = bool(cfg.get('task_vec_normalization_enabled', False))
+		self._task_conditioning = str(cfg.get('task_conditioning', 'axial_params')).lower()
+		if self._task_conditioning in {'axial', 'axial_params', 'param', 'param_only'}:
+			self._task_conditioning = 'axial_params'
+			task_vectors = cfg.get('task_vectors', None)
+			if task_vectors is None or len(task_vectors) == 0:
+				task_vectors = [[0.0] * int(cfg.get('axial_task_vec_dim', 6))]
+			task_vectors = torch.tensor(task_vectors, dtype=torch.float32)
+			if task_vectors.ndim != 2 or task_vectors.shape[-1] != int(cfg.get('axial_task_vec_dim', 6)):
+				raise ValueError(f'Expected task_vectors shape (N, 6), got {tuple(task_vectors.shape)}.')
+			self.register_buffer('_task_vecs', task_vectors)
+			self._init_task_vec_normalization(task_vectors)
+			raw_residual_scale = float(cfg.get(
+				'task_raw_residual_scale',
+				cfg.get('task_context_raw_residual_scale', 0.0),
+			))
+			self._task_encoder = AxialTaskEncoder(
+				task_dim=cfg.task_dim,
+				task_vec_dim=int(cfg.get('axial_task_vec_dim', 6)),
+				repair_enabled=bool(cfg.get('task_context_repair_enabled', False)),
+				raw_residual_scale=raw_residual_scale,
+				normalize_inputs=False,
+				normalization_eps=float(cfg.get('task_vec_normalization_eps', 1.0e-6)),
+			)
+			if hasattr(self, "_task_vec_norm_mean") and hasattr(self, "_task_vec_norm_std"):
+				self._task_encoder.set_normalization_stats(
+					self._task_vec_norm_mean,
+					self._task_vec_norm_std,
+					float(getattr(self, "_task_vec_normalization_eps", 1.0e-6)),
+				)
+			if cfg.rank == 0:
+				print(f'Using AxialTaskEncoder param-only task conditioning: {tuple(task_vectors.shape)} -> {cfg.task_dim}D.')
+		elif self._task_conditioning in {'none', 'disabled'} or cfg.task_dim <= 0:
+			self._task_conditioning = 'none'
+			if cfg.rank == 0:
+				print('Task conditioning disabled.')
+		elif cfg.finetune:
+			self._task_emb = nn.Embedding(200, cfg.task_dim)
+			self._task_emb._parameters['weight'] = torch.tensor(self.cfg.task_embeddings[:1], dtype=torch.float32).repeat(200, 1)
+			print(f'Using task-id embedding ablation for task {self.cfg.task}.')
+		else:
+			self._task_emb = nn.Embedding(len(cfg.task_embeddings), cfg.task_dim) if cfg.task_dim > 0 else None
+			if self._task_emb is not None:
+				if cfg.disable_task_emb:
+					self._task_emb._parameters['weight'] = torch.zeros_like(self._task_emb._parameters['weight'])
+					if cfg.rank == 0:
+						print('Warning: Task embeddings are DISABLED by setting them to all zeros.')
+				elif not cfg.learn_task_emb:
+					self._task_emb._parameters['weight'] = torch.tensor(self.cfg.task_embeddings, dtype=torch.float32)
+					if cfg.rank == 0:
+						print('Using pre-computed task-id embeddings as an ablation.')
+				elif cfg.rank == 0:
+					print('Using learnable task-id embeddings as an ablation.')
+		if self._task_emb is not None:
+			self._task_emb.weight.requires_grad = bool(cfg.learn_task_emb) and not cfg.disable_task_emb
+		if cfg.finetune:
+			self.register_buffer("_action_masks", torch.zeros(200, cfg.action_dim))
+			self._action_masks[:, :cfg.action_dims[0]] = 1.
+		else:
+			self.register_buffer("_action_masks", torch.zeros(len(cfg.action_dims), cfg.action_dim))
+			for i in range(len(cfg.action_dims)):
+				self._action_masks[i, :cfg.action_dims[i]] = 1.
+		if bool(cfg.get('contact_history_enabled', False)):
+			self._contact_context_dim = int(cfg.get('contact_context_dim', 64))
+			self._contact_encoder = ContactHistoryEncoder(
+				history_len=int(cfg.get('contact_history_len', 4)),
+				context_dim=self._contact_context_dim,
+				force_dim=int(cfg.get('contact_force_dim', 6)),
+				action_dim=int(cfg.get('contact_action_dim', 6)),
+				ee_delta_dim=int(cfg.get('contact_ee_delta_dim', 6)),
+				hidden_dim=int(cfg.get('contact_history_hidden_dim', 128)),
+				num_layers=int(cfg.get('contact_history_layers', 2)),
+				use_ee_delta=bool(cfg.get('contact_history_use_ee_delta', True)),
+			)
+			if cfg.rank == 0:
+				print(
+					'Using ContactHistoryEncoder for dynamics conditioning: '
+					f'H={cfg.get("contact_history_len", 4)} -> {self._contact_context_dim}D.'
+				)
+		if self._faca_variant in {'m1', 'm2', 'm3'}:
+			self._execution_history_encoder = ExecutionHistoryEncoder(
+				history_len=int(cfg.get('faca_history_len', 4)),
+				context_dim=int(cfg.get('faca_history_context_dim', 64)),
+				state_dim=int(cfg.get('faca_history_state_dim', 14)),
+				force_dim=int(cfg.get('faca_history_force_dim', 6)),
+				action_dim=int(cfg.get('faca_history_action_dim', cfg.action_dim)),
+				hidden_dim=int(cfg.get('faca_history_hidden_dim', 128)),
+				num_layers=int(cfg.get('faca_history_layers', 2)),
+			)
+			if cfg.rank == 0:
+				print(
+					'Using shared FACA execution-history encoder: '
+					f'H={cfg.get("faca_history_len", 4)} '
+					f'-> {cfg.get("faca_history_context_dim", 64)}D.'
+				)
+		if self._factorized_faca:
+			self._contact_evidence_encoder = ContactEvidenceEncoder(
+				state_dim=policy_state_dim(cfg),
+				history_context_dim=int(cfg.get('faca_history_context_dim', 64)),
+				latent_dim=int(cfg.latent_dim),
+				action_dim=int(cfg.action_dim),
+				contact_context_dim=int(cfg.get('faca_contact_context_dim', 64)),
+				hidden_dim=int(cfg.get('faca_contact_hidden_dim', 128)),
+			)
+			self._encoder = nn.ModuleDict({
+				'state': BeliefEncoder(
+					state_dim=policy_state_dim(cfg),
+					latent_dim=int(cfg.latent_dim),
+					action_dim=int(cfg.action_dim),
+					task_dim=int(cfg.task_dim),
+					contact_context_dim=int(cfg.get('faca_contact_context_dim', 64)),
+					hidden_dim=int(cfg.get('faca_belief_hidden_dim', 128)),
+					simnorm_dim=int(cfg.simnorm_dim),
+				),
+			})
+			aux_hidden = int(cfg.get('faca_aux_head_hidden_dim', 128))
+			self._alignment_head = AlignmentHead(cfg.latent_dim, cfg.task_dim, aux_hidden)
+			self._contact_mode_head = ContactModeHead(cfg.latent_dim, cfg.task_dim, aux_hidden)
+			if cfg.rank == 0:
+				print(
+					'Using factorized FACA belief: '
+					f'contact_in={self._contact_evidence_encoder.input_dim} '
+					f'belief_in={self._encoder["state"].input_dim} latent={cfg.latent_dim}.'
+				)
+		else:
+			self._encoder = layers.enc(cfg)
+		if self._task_context_adapter_enabled:
+			if cfg.task_dim <= 0 or self._task_conditioning == 'none':
+				raise ValueError("task_context_adapter_enabled=true requires active task conditioning.")
+			self._task_context_adapters = nn.ModuleDict()
+			adapter_hidden_dim = int(cfg.get('task_context_adapter_hidden_dim', 128))
+			adapter_alpha = float(cfg.get('task_context_adapter_alpha', 1.0))
+			adapter_input_dim = self._task_adapter_context_dim()
+			adapter_specs = {
+				"encoder": bool(cfg.get('task_context_adapter_apply_encoder', True)),
+				"dynamics": bool(cfg.get('task_context_adapter_apply_dynamics', True)),
+				"pi": bool(cfg.get('task_context_adapter_apply_policy', True)),
+				"reward": bool(cfg.get('task_context_adapter_apply_reward', True)),
+				"q": bool(cfg.get('task_context_adapter_apply_q', True)),
+			}
+			for name, enabled in adapter_specs.items():
+				if not enabled:
+					continue
+				self._task_context_adapters[name] = TaskContextFiLMAdapter(
+					feature_dim=cfg.latent_dim,
+					task_dim=adapter_input_dim,
+					hidden_dim=adapter_hidden_dim,
+					alpha=adapter_alpha,
+				)
+			if len(self._task_context_adapters) == 0:
+				raise ValueError("task_context_adapter_enabled=true but all adapter apply flags are false.")
+			if cfg.rank == 0:
+				print(
+					'Using zero-init task context FiLM adapters: '
+					f"sites={list(self._task_context_adapters.keys())} "
+					f"latent_dim={cfg.latent_dim} source={self._task_context_adapter_source} "
+					f"adapter_input_dim={adapter_input_dim} "
+					f"hidden={adapter_hidden_dim} alpha={adapter_alpha}."
+				)
+		dynamics_in_dim = cfg.latent_dim + cfg.action_dim + cfg.task_dim + self._contact_context_dim
+		self._dynamics = layers.mlp(dynamics_in_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
+		if self._latent_residual_enabled:
+			force_history_len = cfg.get('latent_residual_force_history_len', None)
+			force_dim = cfg.get('latent_residual_force_dim', None)
+			if force_history_len is None:
+				force_history_len = cfg.get('contact_history_len', 4)
+			if force_dim is None:
+				force_dim = cfg.get('contact_force_dim', 6)
+			self._latent_residual_adapter = TaskConditionedLatentContactResidualAdapter(
+				latent_dim=cfg.latent_dim,
+				action_dim=cfg.action_dim,
+				task_dim=cfg.task_dim,
+				force_history_len=int(force_history_len),
+				force_dim=int(force_dim),
+				contact_feature_dim=int(cfg.get('latent_residual_contact_feature_dim', 0)),
+				hidden_dim=int(cfg.get('latent_residual_hidden_dim', 256)),
+				num_layers=int(cfg.get('latent_residual_num_layers', 2)),
+				alpha=float(cfg.get('latent_residual_alpha', 0.1)),
+				delta_z_clip=float(cfg.get('latent_residual_clip', 0.1)),
+				gate_mode=str(cfg.get('latent_residual_gate_mode', 'always')),
+				use_force=bool(cfg.get('latent_residual_use_force', True)),
+				use_task_vec=bool(cfg.get('latent_residual_use_task_vec', True)),
+				use_z_next_base=bool(cfg.get('latent_residual_use_z_next_base', True)),
+				contact_force_threshold=float(cfg.get('latent_residual_contact_force_threshold', 0.0)),
+			)
+			self.register_buffer("_latent_residual_alpha_scale", torch.ones(()))
+			if cfg.rank == 0:
+				print(
+					'Using TaskConditionedLatentContactResidualAdapter: '
+					f'in_dim={self._latent_residual_adapter.input_dim} '
+					f'hidden={cfg.get("latent_residual_hidden_dim", 256)} '
+					f'layers={cfg.get("latent_residual_num_layers", 2)} '
+					f'alpha={cfg.get("latent_residual_alpha", 0.1)} '
+					f'clip={cfg.get("latent_residual_clip", 0.1)} '
+					f'gate={cfg.get("latent_residual_gate_mode", "always")}.'
+				)
+		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1))
+		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
+		self._Qs = layers.QOnlineTargetEnsemble(cfg)
+		self.apply(init.weight_init)
+		if self._task_encoder is not None:
+			self._task_encoder.reset_repair_to_identity()
+		if self._task_context_adapters is not None:
+			for adapter in self._task_context_adapters.values():
+				adapter.reset_to_identity()
+		if self._latent_residual_adapter is not None:
+			self._latent_residual_adapter.reset_residual_to_zero()
+		init.zero_(self._reward[-1].weight)
+		for i in range(cfg.num_q):
+			init.zero_(self._Qs.online._Qs[i][-1].weight)
+			init.zero_(self._Qs.target._Qs[i][-1].weight)
+		self._Qs.hard_update_target()
+		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
+		self.register_buffer("log_std_dif", torch.tensor(cfg.log_std_max) - self.log_std_min)
+
+	def __repr__(self):
+		repr = 'Newt World Model\n'
+		if self._faca_variant != 'none':
+			repr += f'FACA variant: {self._faca_variant.upper()}\n'
+		modules = []
+		if self._task_encoder is not None:
+			modules.append(('Axial task encoder', self._task_encoder))
+		if self._contact_encoder is not None:
+			modules.append(('Contact history encoder', self._contact_encoder))
+		if self._execution_history_encoder is not None:
+			modules.append(('Execution history encoder', self._execution_history_encoder))
+		if self._contact_evidence_encoder is not None:
+			modules.append(('Contact evidence encoder', self._contact_evidence_encoder))
+		if self._factorized_faca:
+			modules.append(('Belief encoder', self._encoder['state']))
+		if self._alignment_head is not None:
+			modules.append(('Alignment head', self._alignment_head))
+		if self._contact_mode_head is not None:
+			modules.append(('Contact mode head', self._contact_mode_head))
+		if self._task_context_adapters is not None:
+			modules.append(('Task context FiLM adapters', self._task_context_adapters))
+		if self._latent_residual_adapter is not None:
+			modules.append(('Latent contact residual adapter', self._latent_residual_adapter))
+		modules.extend([
+			('Encoder', self._encoder),
+			('Dynamics', self._dynamics),
+			('Reward', self._reward),
+			('Policy prior', self._pi),
+			('Q-functions', self._Qs.online),
+		])
+		for name, module in modules:
+			params = "{:,}".format(sum(p.numel() for p in module.parameters() if p.requires_grad))
+			repr += f"{name} ({params}): {module}\n"
+		repr += "Learnable parameters: {:,}".format(self.total_params)
+		return repr
+
+	@property
+	def total_params(self):
+		return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+	def latent_residual_parameters(self):
+		if self._latent_residual_adapter is None:
+			return []
+		return list(self._latent_residual_adapter.parameters())
+
+	def task_context_adapter_parameters(self):
+		if self._task_context_adapters is None:
+			return []
+		return list(self._task_context_adapters.parameters())
+
+	def factorized_auxiliary_parameters(self):
+		if not self._factorized_faca:
+			return []
+		return list(self._alignment_head.parameters()) + list(self._contact_mode_head.parameters())
+
+	def _init_task_vec_normalization(self, task_vectors):
+		if not self._task_vec_normalization_enabled:
+			return
+		stats_fp = self.cfg.get('task_vec_normalization_stats_fp', None)
+		eps = float(self.cfg.get('task_vec_normalization_eps', 1.0e-6))
+		cfg_mean = self.cfg.get('task_vec_normalization_mean', None)
+		cfg_std = self.cfg.get('task_vec_normalization_std', None)
+		if cfg_mean is not None and cfg_std is not None:
+			mean = torch.tensor(cfg_mean, dtype=torch.float32)
+			std = torch.tensor(cfg_std, dtype=torch.float32)
+		elif stats_fp:
+			stats_path = Path(str(stats_fp)).expanduser()
+			with open(stats_path, "r", encoding="utf-8") as f:
+				payload = json.load(f)
+			stats = payload.get("stats", payload)
+			mean = torch.tensor(stats["mean"], dtype=torch.float32)
+			std = torch.tensor(stats["std"], dtype=torch.float32)
+			eps = float(stats.get("eps", eps))
+		else:
+			mean = task_vectors.float().mean(dim=0)
+			std = task_vectors.float().std(dim=0, unbiased=False)
+		std = std.clamp_min(eps)
+		self.register_buffer("_task_vec_norm_mean", mean, persistent=False)
+		self.register_buffer("_task_vec_norm_std", std, persistent=False)
+		self._task_vec_normalization_eps = eps
+		if self.cfg.rank == 0:
+			print(
+				"Task vector normalization enabled: "
+				f"mean={[round(float(x), 6) for x in mean.tolist()]} "
+				f"std={[round(float(x), 6) for x in std.tolist()]}."
+			)
+
+	def normalize_task_vec(self, task_vec):
+		if not self._task_vec_normalization_enabled or not hasattr(self, "_task_vec_norm_mean"):
+			return task_vec
+		mean = self._task_vec_norm_mean.to(device=task_vec.device, dtype=task_vec.dtype)
+		std = self._task_vec_norm_std.to(device=task_vec.device, dtype=task_vec.dtype)
+		return (task_vec - mean) / std.clamp_min(float(getattr(self, "_task_vec_normalization_eps", 1.0e-6)))
+
+	def task_vec_normalization_metadata(self):
+		if not self._task_vec_normalization_enabled or not hasattr(self, "_task_vec_norm_mean"):
+			return {}
+		return {
+			"task_vec_normalization_mean": [float(x) for x in self._task_vec_norm_mean.detach().cpu().tolist()],
+			"task_vec_normalization_std": [float(x) for x in self._task_vec_norm_std.detach().cpu().tolist()],
+			"task_vec_normalization_eps": float(getattr(self, "_task_vec_normalization_eps", 1.0e-6)),
+		}
+
+	def freeze_base_world_model(self):
+		"""
+		Freeze the original world model trunk and leave only the residual adapter trainable.
+		"""
+		train_task_adapter = bool(self.cfg.get('task_context_adapter_train_with_frozen_base', True))
+		train_task_repair = bool(self.cfg.get('task_context_repair_enabled', False))
+		for name, param in self.named_parameters():
+			param.requires_grad_(
+				name.startswith('_latent_residual_adapter.') or
+				(train_task_adapter and name.startswith('_task_context_adapters.')) or
+				(train_task_repair and name.startswith('_task_encoder.'))
+			)
+		if self._latent_residual_adapter is not None:
+			for param in self._latent_residual_adapter.parameters():
+				param.requires_grad_(True)
+		if train_task_adapter and self._task_context_adapters is not None:
+			for param in self._task_context_adapters.parameters():
+				param.requires_grad_(True)
+		if train_task_repair and self._task_encoder is not None:
+			for param in self._task_encoder.parameters():
+				param.requires_grad_(True)
+
+	def set_latent_residual_alpha_scale(self, value):
+		if hasattr(self, '_latent_residual_alpha_scale'):
+			self._latent_residual_alpha_scale.fill_(float(value))
+
+	def to(self, *args, **kwargs):
+		super().to(*args, **kwargs)
+		return self
+
+	def train(self, mode=True):
+		"""
+		Overriding `train` method to keep target Q-networks in eval mode.
+		"""
+		super().train(mode)
+		self._Qs.target.train(False)
+		return self
+
+	def soft_update_target_Q(self):
+		"""
+		Soft-update target Q-networks using Polyak averaging.
+		"""
+		self._Qs.soft_update_target()
+
+	def _broadcast_task_ids(self, task, x):
+		x_batch_shape = x.shape[:-1]
+		if task is None:
+			num_tasks = (
+				self._task_vecs.shape[0] if hasattr(self, '_task_vecs')
+				else self._task_emb.num_embeddings
+			)
+			if num_tasks == 1:
+				return torch.zeros(x_batch_shape, device=x.device, dtype=torch.long)
+			raise ValueError("Task ids are required when using multi-task conditioning.")
+		if isinstance(task, int):
+			task = torch.tensor([task], device=x.device)
+		task = task.to(x.device, non_blocking=True)
+
+		if task.ndim == 1 and len(x_batch_shape) > 1:
+			if task.shape[0] == x_batch_shape[0]:
+				task = task.view(task.shape[0], *([1] * (len(x_batch_shape) - 1)))
+			elif task.shape[0] == x_batch_shape[-1]:
+				task = task.view(*([1] * (len(x_batch_shape) - 1)), task.shape[0])
+		while task.ndim < len(x_batch_shape):
+			task = task.unsqueeze(-1)
+		try:
+			return task.expand(*x_batch_shape).long()
+		except RuntimeError:
+			if task.numel() == int(torch.tensor(x_batch_shape).prod().item()):
+				return task.reshape(*x_batch_shape).long()
+			raise ValueError(
+				f"Incompatible task shape: got {tuple(task.shape)}, expected broadcastable to {x_batch_shape} "
+				f"(x.shape = {tuple(x.shape)})"
+			)
+
+	def _expand_task_context(self, context, x):
+		x_batch_shape = x.shape[:-1]
+		context_dim = context.shape[-1]
+		while context.ndim < x.ndim:
+			context = context.unsqueeze(-2)
+		try:
+			return context.expand(*x_batch_shape, context_dim)
+		except RuntimeError:
+			if context.numel() == int(torch.tensor((*x_batch_shape, context_dim)).prod().item()):
+				return context.reshape(*x_batch_shape, context_dim)
+			raise ValueError(
+				f"Incompatible task context shape: got {tuple(context.shape)}, "
+				f"expected broadcastable to {(*x_batch_shape, context_dim)}."
+			)
+
+	def _is_task_vec(self, task):
+		return (
+			task is not None and
+			torch.is_tensor(task) and
+			task.is_floating_point() and
+			task.ndim > 0 and
+			task.shape[-1] == self.cfg.axial_task_vec_dim
+		)
+
+	def task_ids_for_shape(self, task, batch_shape, device=None):
+		device = device or (task.device if torch.is_tensor(task) else self._action_masks.device)
+		batch_shape = tuple(int(dim) for dim in batch_shape)
+		if self._is_task_vec(task):
+			task_ids = torch.zeros(task.shape[:-1], dtype=torch.long, device=device)
+		elif task is None:
+			if self._action_masks.shape[0] == 1:
+				return torch.zeros(batch_shape, device=device, dtype=torch.long)
+			raise ValueError("Task ids are required when using multi-task action metadata.")
+		else:
+			if isinstance(task, int):
+				task = torch.tensor([task], device=device)
+			task_ids = task.to(device, non_blocking=True).long()
+		if task_ids.ndim == 0:
+			task_ids = task_ids.view(1)
+		if task_ids.ndim == 1 and len(batch_shape) > 1:
+			if task_ids.shape[0] == batch_shape[0]:
+				task_ids = task_ids.view(task_ids.shape[0], *([1] * (len(batch_shape) - 1)))
+			elif task_ids.shape[0] == batch_shape[-1]:
+				task_ids = task_ids.view(*([1] * (len(batch_shape) - 1)), task_ids.shape[0])
+		while task_ids.ndim < len(batch_shape):
+			task_ids = task_ids.unsqueeze(-1)
+		try:
+			return task_ids.expand(*batch_shape).long()
+		except RuntimeError:
+			if task_ids.numel() == int(torch.tensor(batch_shape).prod().item()):
+				return task_ids.reshape(*batch_shape).long()
+			raise
+
+	def action_mask(self, task, x):
+		task_ids = self.task_ids_for_shape(task, x.shape[:-1], device=x.device)
+		return self._action_masks[task_ids]
+
+	def _task_vec_from_task(self, x, task):
+		if not hasattr(self, '_task_vecs'):
+			return None
+		if self._is_task_vec(task):
+			task_vec = task.to(device=x.device, dtype=torch.float32, non_blocking=True)
+		else:
+			task_ids = self._broadcast_task_ids(task, x)
+			task_vec = self._task_vecs[task_ids]
+		return task_vec
+
+	def task_context_repair_info(self, x, task, reconstruct=True):
+		if self._task_encoder is None:
+			return None
+		task_vec = self._task_vec_from_task(x, task)
+		if task_vec is None:
+			return None
+		task_vec_norm = self.normalize_task_vec(task_vec)
+		parts = self._task_encoder.forward_parts(task_vec_norm)
+		out = {
+			"task_vec": self._expand_task_context(task_vec, x),
+			"task_vec_norm": self._expand_task_context(parts["task_vec_norm"], x),
+			"axial_context": self._expand_task_context(parts["axial_context"], x),
+			"raw_residual": self._expand_task_context(parts["raw_residual"], x),
+			"task_context": self._expand_task_context(parts["task_context"], x),
+		}
+		if reconstruct:
+			out["task_recon"] = self._task_encoder.reconstruct(out["task_context"])
+		return out
+
+	def task_context(self, x, task):
+		if self._task_encoder is not None:
+			info = self.task_context_repair_info(x, task, reconstruct=False)
+			return None if info is None else info["task_context"]
+
+		if not hasattr(self, '_task_emb') or self._task_emb is None:
+			return None
+		task_ids = self._broadcast_task_ids(task, x)
+		return self._expand_task_context(self._task_emb(task_ids), x)
+
+	def raw_task_vec_context(self, x, task):
+		task_vec = self._task_vec_from_task(x, task)
+		if task_vec is None:
+			return None
+		task_vec = self.normalize_task_vec(task_vec)
+		return self._expand_task_context(task_vec, x)
+
+	def _task_adapter_context_dim(self):
+		source = self._task_context_adapter_source
+		if source in {'task_context', 'context', 'encoded'}:
+			return int(self.cfg.task_dim)
+		if source in {'raw_task_vec', 'task_vec', 'raw'}:
+			return int(self.cfg.get('axial_task_vec_dim', 6))
+		if source in {'both', 'concat', 'task_context_and_raw'}:
+			return int(self.cfg.task_dim) + int(self.cfg.get('axial_task_vec_dim', 6))
+		raise ValueError(
+			f"Unknown task_context_adapter_source={source!r}. "
+			"Use task_context, raw_task_vec, or both."
+		)
+
+	def task_adapter_context(self, x, task):
+		source = self._task_context_adapter_source
+		if source in {'task_context', 'context', 'encoded'}:
+			return self.task_context(x, task)
+		if source in {'raw_task_vec', 'task_vec', 'raw'}:
+			return self.raw_task_vec_context(x, task)
+		if source in {'both', 'concat', 'task_context_and_raw'}:
+			context = self.task_context(x, task)
+			raw = self.raw_task_vec_context(x, task)
+			if context is None:
+				return raw
+			if raw is None:
+				return context
+			return torch.cat([context, raw], dim=-1)
+		raise ValueError(
+			f"Unknown task_context_adapter_source={source!r}. "
+			"Use task_context, raw_task_vec, or both."
+		)
+
+	def task_emb(self, x, task):
+		"""
+		Appends the task context to input x.
+
+		Main path: task id -> task_vec_6 -> AxialTaskEncoder -> c_task.
+		A task-id embedding path is retained only as an ablation.
+		"""
+		context = self.task_context(x, task)
+		if context is None:
+			return x
+		return torch.cat([x, context], dim=-1)
+
+	def task_context_adapt(self, site, x, task):
+		if self._task_context_adapters is None or site not in self._task_context_adapters:
+			return x
+		context = self.task_adapter_context(x, task)
+		if context is None:
+			return x
+		return self._task_context_adapters[site](x, context)
+
+	def task_context_adapter_metrics(self):
+		if self._task_context_adapters is None:
+			return {}
+		out = {
+			"task_context_adapter_enabled": torch.tensor(1.0, device=self.log_std_min.device),
+		}
+		for name, adapter in self._task_context_adapters.items():
+			for key, value in adapter.metrics().items():
+				out[f"task_context_adapter_{name}_{key}"] = value
+		return out
+
+	def contact_context(
+		self,
+		x,
+		contact_context=None,
+		force_history=None,
+		action_history=None,
+		ee_delta_history=None,
+	):
+		if self._contact_encoder is None:
+			return None
+		if contact_context is not None:
+			contact_context = contact_context.to(device=x.device, dtype=torch.float32, non_blocking=True)
+			return self._expand_task_context(contact_context, x)
+		if force_history is None and action_history is None and ee_delta_history is None:
+			return x.new_zeros(*x.shape[:-1], self._contact_context_dim)
+		if force_history is None or action_history is None:
+			raise ValueError("force_history and action_history are required when contact history conditioning is used.")
+		force_history = force_history.to(device=x.device, dtype=torch.float32, non_blocking=True)
+		action_history = action_history.to(device=x.device, dtype=torch.float32, non_blocking=True)
+		if ee_delta_history is not None:
+			ee_delta_history = ee_delta_history.to(device=x.device, dtype=torch.float32, non_blocking=True)
+		context = self._contact_encoder(force_history, action_history, ee_delta_history)
+		return self._expand_task_context(context, x)
+
+	def contact_emb(
+		self,
+		x,
+		contact_context=None,
+		force_history=None,
+		action_history=None,
+		ee_delta_history=None,
+	):
+		context = self.contact_context(
+			x,
+			contact_context=contact_context,
+			force_history=force_history,
+			action_history=action_history,
+			ee_delta_history=ee_delta_history,
+		)
+		if context is None:
+			return x
+		return torch.cat([x, context], dim=-1)
+
+	def _faca_runtime_state(self, obs):
+		if uses_state_goal(self.cfg):
+			return split_state_goal_observation(obs, require_wrench=self._faca_variant != "m0")[0]
+		if self._faca_variant not in {'m1', 'm2', 'm3'}:
+			return obs
+		state_dim = int(self.cfg.get('faca_history_state_dim', 14))
+		force_dim = int(self.cfg.get('faca_history_force_dim', 6))
+		if obs.shape[-1] != state_dim + force_dim:
+			raise ValueError(
+					f"FACA {self._faca_variant.upper()} expected runtime observation width {state_dim + force_dim}, "
+				f"got {tuple(obs.shape)}."
+			)
+		return obs[..., :state_dim]
+
+	def execution_history_context(self, x, execution_history=None):
+		if self._execution_history_encoder is None:
+			return None
+		context_dim = int(self.cfg.get('faca_history_context_dim', 64))
+		if execution_history is None:
+			if uses_state_goal(self.cfg):
+				raise ValueError("State/goal FACA requires explicit execution history for force conditioning.")
+			return x.new_zeros(*x.shape[:-1], context_dim)
+		missing = [
+			key for key in ('state_history', 'force_history', 'action_history')
+			if execution_history.get(key, None) is None
+		]
+		if missing:
+			raise ValueError(f"FACA {self._faca_variant.upper()} execution history is missing: {missing}.")
+		context = self._execution_history_encoder(
+			execution_history['state_history'].to(x.device, non_blocking=True),
+			execution_history['force_history'].to(x.device, non_blocking=True),
+			execution_history['action_history'].to(x.device, non_blocking=True),
+		)
+		return self._expand_task_context(context, x)
+
+	def encode(self, obs, task, execution_history=None, prev_z=None, prev_action=None):
+		"""
+		Encodes an observation into its latent representation.
+		This implementation assumes a single state-based observation.
+		"""
+		if self.cfg.obs == 'state':
+			state = self._faca_runtime_state(obs)
+			if self._factorized_faca:
+				history_context = self.execution_history_context(state, execution_history)
+				if prev_z is None:
+					prev_z = state.new_zeros(*state.shape[:-1], self.cfg.latent_dim)
+				else:
+					prev_z = self._expand_task_context(prev_z.to(state.device, non_blocking=True), state)
+				if prev_action is None:
+					prev_action = state.new_zeros(*state.shape[:-1], self.cfg.action_dim)
+				else:
+					prev_action = self._expand_task_context(prev_action.to(state.device, non_blocking=True), state)
+				task_context = self.task_context(state, task)
+				if task_context is None:
+					raise ValueError("Factorized FACA requires an active task context.")
+				contact_context = self._contact_evidence_encoder(
+					state, history_context, prev_z, prev_action
+				)
+				return self._encoder['state'](
+					state, prev_z, prev_action, task_context, contact_context
+				)
+			x = self.task_emb(state, task)
+			if self._faca_variant == 'm1':
+				history_context = self.execution_history_context(x, execution_history)
+				if prev_z is None:
+					prev_z = x.new_zeros(*x.shape[:-1], self.cfg.latent_dim)
+				else:
+					prev_z = self._expand_task_context(prev_z.to(x.device, non_blocking=True), x)
+				if prev_action is None:
+					prev_action = x.new_zeros(*x.shape[:-1], self.cfg.action_dim)
+				else:
+					prev_action = self._expand_task_context(prev_action.to(x.device, non_blocking=True), x)
+				x = torch.cat([x, history_context, prev_z, prev_action], dim=-1)
+			z = self._encoder[self.cfg.obs](x)
+			return self.task_context_adapt("encoder", z, task)
+		assert isinstance(obs, TensorDict), "Expected observation to be a TensorDict"
+		z = torch.cat([self.task_emb(obs['state'], task), obs['rgb']], dim=-1)
+		z = self._encoder['state'](z)
+		return self.task_context_adapt("encoder", z, task)
+
+		# z_rgb = self._encoder['rgb'](obs['rgb'])
+		# return torch.stack((z_state, z_rgb), dim=0).mean(0)
+
+		# z_state = self._encoder['state'](self.task_emb(obs['state'], task))
+		# z_cat = torch.cat([z_state, self.task_emb(obs['rgb'], task)], dim=-1)
+		# out = self._encoder['rgb'](z_cat)
+
+		return out
+
+	def predict_auxiliary(self, z, task):
+		"""Predict privileged training targets from belief and static task context."""
+		if not self._factorized_faca:
+			raise RuntimeError("Auxiliary heads exist only for factorized FACA M2/M3.")
+		task_context = self.task_context(z, task)
+		if task_context is None:
+			raise ValueError("Factorized FACA auxiliary heads require task context.")
+		return self._alignment_head(z, task_context), self._contact_mode_head(z, task_context)
+
+	def next(
+		self,
+		z,
+		a,
+		task,
+		contact_context=None,
+		force_history=None,
+		action_history=None,
+		ee_delta_history=None,
+		residual_force_history=None,
+		contact_feature=None,
+		return_info=False,
+	):
+		"""
+		Predicts the next latent state given the current latent state and action.
+		"""
+		if self._factorized_faca:
+			measured = {
+				'contact_context': contact_context,
+				'force_history': force_history,
+				'action_history': action_history,
+				'ee_delta_history': ee_delta_history,
+				'residual_force_history': residual_force_history,
+				'contact_feature': contact_feature,
+			}
+			provided = [name for name, value in measured.items() if value is not None]
+			if provided:
+				raise ValueError(
+					"Factorized FACA imagination is D(z,a,c_task) only; measured future "
+					f"evidence is forbidden: {provided}."
+				)
+		z_base = z
+		z = self.task_emb(z_base, task)
+		z = self.contact_emb(
+			z,
+			contact_context=contact_context,
+			force_history=force_history,
+			action_history=action_history,
+			ee_delta_history=ee_delta_history,
+		)
+		z = torch.cat([z, a], dim=-1)
+		z_next_base = self._dynamics(z)
+		z_next_base = self.task_context_adapt("dynamics", z_next_base, task)
+		if self._latent_residual_adapter is None:
+			if return_info:
+				return z_next_base, {"_z_next_base": z_next_base}
+			return z_next_base
+		task_context = self.task_context(z_base, task) if bool(self.cfg.get('latent_residual_use_task_vec', True)) else None
+		force_hist = residual_force_history if residual_force_history is not None else force_history
+		z_next_adapted, info = self._latent_residual_adapter(
+			z=z_base,
+			action=a,
+			z_next_base=z_next_base,
+			task_vec=task_context,
+			force_hist=force_hist,
+			contact_feature=contact_feature,
+			alpha_scale=getattr(self, '_latent_residual_alpha_scale', None),
+		)
+		if return_info:
+			info["_z_next_base"] = z_next_base
+			return z_next_adapted, info
+		return z_next_adapted
+
+	def reward(self, z, a, task):
+		"""
+		Predicts instantaneous (single-step) reward.
+		"""
+		z = self.task_context_adapt("reward", z, task)
+		z = self.task_emb(z, task)
+		z = torch.cat([z, a], dim=-1)
+		return self._reward(z)
+
+	def pi(self, z, task):
+		"""
+		Samples an action from the policy prior.
+		The policy prior is a Gaussian distribution with
+		mean and (log) std predicted by a neural network.
+		"""
+		z = self.task_context_adapt("pi", z, task)
+		z = self.task_emb(z, task)
+
+		# Gaussian policy prior
+		mean, log_std = self._pi(z).chunk(2, dim=-1)
+		log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
+		eps = torch.randn_like(mean)
+
+		action_mask = self.action_mask(task, mean)  # shape: (*batch_dims, action_dim)
+		while action_mask.ndim < mean.ndim:
+			action_mask = action_mask.unsqueeze(-2)  # Add sequence dim (or other mid-batch dim)
+		action_mask = action_mask.expand_as(mean)  # Ensure shape matches mean
+
+		mean = mean * action_mask
+		log_std = log_std * action_mask
+		eps = eps * action_mask
+
+		action_dims = action_mask.sum(-1, keepdim=True)
+		log_prob = math.gaussian_logprob(eps, log_std)
+
+		# Scale log probability by action dimensions
+		size = eps.shape[-1] if action_dims is None else action_dims
+		scaled_log_prob = log_prob * size
+
+		# Reparameterization trick
+		action = mean + eps * log_std.exp()
+		mean, action, log_prob = math.squash(mean, action, log_prob)
+
+		entropy_scale = scaled_log_prob / (log_prob + 1e-8)
+		info = TensorDict({
+			"mean": mean,
+			"log_std": log_std,
+			"entropy": -log_prob,
+			"scaled_entropy": -log_prob * entropy_scale,
+		})
+		return action, info
+
+	def Q(self, z, a, task, return_type='min', target=False, detach=False):
+		"""
+		Predict state-action value.
+		`return_type` can be one of [`min`, `avg`, `all`]:
+			- `min`: return the minimum of two randomly subsampled Q-values.
+			- `avg`: return the average of two randomly subsampled Q-values.
+			- `all`: return all Q-values.
+		`target` specifies whether to use the target Q-networks or not.
+		"""
+		assert return_type in {'min', 'avg', 'all'}
+		z = self.task_context_adapt("q", z, task)
+		z = self.task_emb(z, task)
+		z = torch.cat([z, a], dim=-1)
+
+		out = self._Qs(z, target=target)
+		if detach:
+			out = out.detach()
+
+		if return_type == 'all':
+			return out
+
+		qidx = torch.randperm(self.cfg.num_q, device=out.device)[:2]
+		Q = math.two_hot_inv(out[qidx], self.cfg)
+		if return_type == "min":
+			return Q.min(0).values
+		return Q.sum(0) / 2
