@@ -1,5 +1,4 @@
-/* Paths are relative to docs/index.html. The overview entry is the main video;
- * other entries populate the simulation gallery.
+/* Paths are relative to docs/index.html. All videos appear in the simulation gallery.
  * Refresh from videos/: python scripts/sync_site_videos.py
  */
 window.FACA_SITE = {
@@ -8,7 +7,7 @@ window.FACA_SITE = {
   "paperUrl": "assets/faca-paper.pdf",
   "videos": [
     {
-      "id": "overview",
+      "id": "00062_01",
       "title": "Assembly 00062 · Clip 01",
       "src": "assets/videos/00062_01.mp4",
       "poster": "assets/videos/00062_01-poster.jpg",

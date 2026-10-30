@@ -69,7 +69,7 @@
     const video = document.createElement("video");
     video.controls = true;
     video.playsInline = true;
-    video.preload = item.id === "overview" ? "metadata" : "none";
+    video.preload = "none";
     video.setAttribute("aria-label", item.title || "FACA simulation video");
     const poster = safeLink(item.poster);
     if (poster) video.poster = poster;

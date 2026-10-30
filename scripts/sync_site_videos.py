@@ -32,7 +32,7 @@ def main():
         raise ValueError(f'No video files found in {source}')
     destination.mkdir(parents=True, exist_ok=True)
     videos = []
-    for index, video_path in enumerate(files):
+    for video_path in files:
         target = destination / video_path.name
         if (not target.exists() or target.stat().st_size != video_path.stat().st_size
                 or target.stat().st_mtime_ns != video_path.stat().st_mtime_ns):
@@ -55,7 +55,7 @@ def main():
         default_title = (f'Assembly {name[1]} · Clip {name[2]}' if name else video_path.stem)
         old = previous.get(video_path.name, {})
         videos.append({
-            'id': 'overview' if index == 0 else video_path.stem,
+            'id': video_path.stem,
             'title': old.get('title', default_title),
             'src': f'assets/videos/{video_path.name}',
             'poster': f'assets/videos/{poster.name}' if poster.exists() else '',
@@ -64,12 +64,11 @@ def main():
             'type': 'video/webm' if video_path.suffix.lower() == '.webm' else 'video/mp4',
         })
     config['videos'] = videos
-    header = ('/* Paths are relative to docs/index.html. The overview entry is the main video;\n'
-              ' * other entries populate the simulation gallery.\n'
+    header = ('/* Paths are relative to docs/index.html. All videos appear in the simulation gallery.\n'
               ' * Refresh from videos/: python scripts/sync_site_videos.py\n'
               ' */\nwindow.FACA_SITE = ')
     config_path.write_text(header + json.dumps(config, ensure_ascii=False, indent=2) + ';\n')
-    print(f'Synchronized {len(videos)} videos: 1 featured and {len(videos)-1} gallery clips.')
+    print(f'Synchronized {len(videos)} videos in the simulation gallery.')
     if cv2 is None:
         print('OpenCV not installed: existing posters retained; new clips use native video previews.')
 
