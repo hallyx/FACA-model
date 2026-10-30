@@ -49,6 +49,101 @@
       </figure>
     </section>
 
+    <section class="results" id="results" aria-labelledby="results-title">
+      <h2 id="results-title">Results</h2>
+      <p class="section-intro">From held-out assembly sizes in simulation to limited-data calibration on a real robot.</p>
+
+      <div class="result-highlights">
+        <div class="result-highlight">
+          <span class="result-value">76.1<span>%</span></span>
+          <strong>Simulation success</strong>
+          <p>+10.1 percentage points over task-conditioned TD-MPC2 (M0).</p>
+        </div>
+        <div class="result-highlight">
+          <span class="result-value">82.0<span>%</span></span>
+          <strong>Real-robot success</strong>
+          <p>41/50 trials with correction-assisted residual calibration.</p>
+        </div>
+        <div class="result-highlight">
+          <span class="result-value">740</span>
+          <strong>Calibration transitions</strong>
+          <p>Collected on one anchor task; each adapter serves all ten tasks.</p>
+        </div>
+      </div>
+
+      <article class="result-block" aria-labelledby="held-out-title">
+        <h3 id="held-out-title">Generalization to held-out sizes</h3>
+        <p>FACA is evaluated on ten axial assembly families, with 100 trials per task on held-out test sizes. It reaches 76.1% task-averaged success. In a separate comparison of complete methods, SRSA-style policy transfer reaches 68.3%.</p>
+        <figure class="result-figure">
+          <a href="assets/faca-paper.pdf#page=21" target="_blank" rel="noopener" aria-label="Read Figure 7 and the per-task evaluation in the paper">
+            <img src="assets/results/per-task-success.png" width="1208" height="408" alt="Paper Figure 7: overall and per-task success rates for AutoMate-style PPO, task-conditioned PPO, SRSA-style transfer, and FACA across ten assembly tasks." loading="lazy">
+          </a>
+          <figcaption>Overall and per-task success on held-out sizes. The Task Avg. line averages the four displayed methods within each task. <a href="assets/faca-paper.pdf#page=21" target="_blank" rel="noopener">Paper, Fig. 7</a>.</figcaption>
+        </figure>
+      </article>
+
+      <article class="result-block" aria-labelledby="ablation-title">
+        <h3 id="ablation-title">What each component adds</h3>
+        <p>Matched TD-MPC2 variants share nominal task conditioning and training protocols. Adding interaction history, a separate contact encoder, and auxiliary supervision progressively improves success.</p>
+        <figure class="ablation-chart">
+          <div class="chart-scale" aria-hidden="true"><span>Success rate</span><div class="chart-ticks"><span>0</span><span>50</span><span>100%</span></div></div>
+          <div class="bar-row"><span class="bar-label">M0 · Task-TD-MPC2</span><div class="bar-track"><span class="bar-fill" style="--value:66%"></span></div><strong>66.0%</strong></div>
+          <div class="bar-row"><span class="bar-label">M1 · + Recurrent history</span><div class="bar-track"><span class="bar-fill" style="--value:69%"></span></div><strong>69.0%</strong></div>
+          <div class="bar-row"><span class="bar-label">M2 · + Contact encoder</span><div class="bar-track"><span class="bar-fill" style="--value:71.8%"></span></div><strong>71.8%</strong></div>
+          <div class="bar-row is-faca"><span class="bar-label">M3 · FACA (+ Aux. supervision)</span><div class="bar-track"><span class="bar-fill" style="--value:76.1%"></span></div><strong>76.1%</strong></div>
+          <figcaption>Success rate on the same held-out size split. M0 to M1 jointly adds wrench access, history, and recurrence; M2 to M3 enables both auxiliary losses. <a href="assets/faca-paper.pdf#page=8" target="_blank" rel="noopener">Paper, Table 1</a>.</figcaption>
+        </figure>
+        <details class="result-details">
+          <summary>View all simulation metrics and PPO baselines</summary>
+          <div class="table-scroll" role="region" aria-label="Simulation results table" tabindex="0">
+            <table class="results-table">
+              <caption>Held-out test sizes · Paper, Table 7</caption>
+              <thead><tr><th scope="col">Method</th><th scope="col">Success ↑</th><th scope="col">Final progress ↑</th><th scope="col">Near-jam incidence ↓</th><th scope="col">Peak force* ↓</th></tr></thead>
+              <tbody>
+                <tr><th scope="row">AutoMate-style PPO</th><td>54.1%</td><td>0.63</td><td>30.6%</td><td>20.9 N</td></tr>
+                <tr><th scope="row">Task-PPO</th><td>53.6%</td><td>0.65</td><td>34.1%</td><td>20.1 N</td></tr>
+                <tr><th scope="row">Task-TD-MPC2 (M0)</th><td>66.0%</td><td>0.73</td><td>25.2%</td><td>19.6 N</td></tr>
+                <tr><th scope="row">+ Recurrent history (M1)</th><td>69.0%</td><td>0.77</td><td>23.1%</td><td>16.4 N</td></tr>
+                <tr><th scope="row">+ Contact encoder (M2)</th><td>71.8%</td><td>0.79</td><td>22.4%</td><td>13.5 N</td></tr>
+                <tr class="is-faca"><th scope="row">FACA (M3)</th><td>76.1%</td><td>0.84</td><td>20.4%</td><td>12.9 N</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="metric-note">Final progress is terminal insertion depth normalized by target depth and clipped to [0, 1] per trial, averaged over all trials. *Peak force is mean episode-peak force only for trials without a detected near-jam event (J = 0), rather than all-trial force exposure. Near-jam incidence is an event diagnostic; trials may recover and succeed.</p>
+        </details>
+        <p class="metric-note">Simulation success requires at least 85% target insertion depth and clearance-dependent lateral alignment over the final three control samples. <a href="assets/faca-paper.pdf#page=19" target="_blank" rel="noopener">Evaluation protocol, Appendix D</a>.</p>
+      </article>
+
+      <article class="result-block" aria-labelledby="real-results-title">
+        <h3 id="real-results-title">Real-robot calibration</h3>
+        <p>On a Franka Research 3 with wrist force/torque sensing, correction-assisted collection improves residual calibration from 68.0% to 82.0% success under the same 740-transition budget and calibration objective.</p>
+        <div class="table-scroll" role="region" aria-label="Real-robot calibration results table" tabindex="0">
+          <table class="results-table">
+            <caption>50 evaluation trials per method · 10 tasks · Paper, Table 2</caption>
+            <thead><tr><th scope="col">Method</th><th scope="col">Success ↑</th><th scope="col">Final progress ↑</th><th scope="col">Protective stops ↓</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Sim-only</th><td>52.0% <span class="trial-count">(26/50)</span></td><td>0.61</td><td>36.0%</td></tr>
+              <tr><th scope="row">Full-FT</th><td>60.0% <span class="trial-count">(30/50)</span></td><td>0.69</td><td>30.0%</td></tr>
+              <tr><th scope="row">Auto-adapt</th><td>68.0% <span class="trial-count">(34/50)</span></td><td>0.74</td><td>24.0%</td></tr>
+              <tr class="is-faca"><th scope="row">HIL-adapt</th><td>82.0% <span class="trial-count">(41/50)</span></td><td>0.86</td><td>10.0%</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="metric-note">Auto-adapt and HIL-adapt each use ten collection episodes on one anchor task. HIL-adapt includes up to 111 operator corrective actions during collection; evaluation uses frozen models. Hardware success requires completed insertion to remain stable for at least 1 s; protective stops count as failures. <a href="assets/faca-paper.pdf#page=23" target="_blank" rel="noopener">Protocol, Appendix F</a>.</p>
+      </article>
+
+      <article class="result-block" aria-labelledby="recovery-title">
+        <h3 id="recovery-title">Contact recovery in action</h3>
+        <p>For hole-onto-peg assembly 00186 at scale 1.050, separately recorded rollouts start from matched initial poses. After contact and repositioning, FACA advances insertion while M0 remains stalled during the displayed interval.</p>
+        <figure class="result-figure recovery-figure">
+          <a href="assets/faca-paper.pdf#page=22" target="_blank" rel="noopener" aria-label="Read the contact-recovery example in Figure 8">
+            <img src="assets/results/contact-recovery.png" width="1116" height="838" alt="Paper Figure 8: reconstructed assembly poses and recorded insertion-progress and pair-force traces over 0 to 1.6 seconds. FACA repositions and inserts the orange held hole part over the blue fixed peg; M0 stays above the peg." loading="lazy">
+          </a>
+          <figcaption>A qualitative 0–1.6 s excerpt. The 0.85 line marks only the depth threshold; terminal success uses the full evaluation protocol. The force trace is plug–socket pair force, distinct from the wrist-wrench input. <a href="assets/faca-paper.pdf#page=22" target="_blank" rel="noopener">Paper, Fig. 8</a>.</figcaption>
+        </figure>
+      </article>
+    </section>
+
     <section class="additional-videos" aria-labelledby="simulation-title" hidden>
       <h2 id="simulation-title">Simulation</h2>
       <div class="video-grid" data-video-gallery></div>

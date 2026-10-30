@@ -38,6 +38,46 @@ h2 { margin: 0 0 18px; font: 400 30px/1.2 var(--sans); text-align: center; }
 .additional-videos { border-top: 1px solid var(--line); margin-top: 33px; padding-top: 28px; }
 .video-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 22px 18px; }
 footer { border-top: 1px solid var(--line); text-align: center; margin-top: 35px; padding-top: 20px; color: var(--muted); font-size: 14px; }
+.results { border-top: 1px solid var(--line); margin-top: 35px; padding-top: 30px; }
+.section-intro { text-align: center; color: var(--muted); }
+.result-highlights { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 22px; margin: 27px 0 36px; }
+.result-highlight { border-top: 2px solid #a66120; padding-top: 14px; }
+.result-value { display: block; color: #925213; font: 400 43px/1.15 var(--sans); font-variant-numeric: tabular-nums; }
+.result-value > span { font-size: 26px; }
+.result-highlight > strong { display: block; margin-top: 7px; font: 600 16px/1.4 var(--sans); }
+.result-highlight > p { margin-top: 6px; font-size: 15px; line-height: 1.5; color: var(--muted); }
+.result-block + .result-block { margin-top: 34px; }
+.result-block h3 { margin: 0 0 12px; font: 400 23px/1.3 var(--sans); }
+.result-figure { margin-top: 20px; }
+.result-figure img { width: 100%; height: auto; }
+.result-figure a:focus-visible { display: block; }
+.recovery-figure { max-width: 790px; margin-left: auto; margin-right: auto; }
+.results figcaption a, .metric-note a { text-decoration: underline; text-underline-offset: 3px; }
+.ablation-chart { margin-top: 20px; padding: 20px; border: 1px solid var(--line); }
+.chart-scale, .bar-row { display: grid; grid-template-columns: 265px minmax(0, 1fr) 62px; align-items: center; gap: 12px; font: 14px/1.4 var(--sans); }
+.chart-scale { margin-bottom: 12px; color: var(--muted); font-size: 12px; }
+.chart-ticks { display: flex; justify-content: space-between; }
+.bar-row + .bar-row { margin-top: 14px; }
+.bar-row strong { text-align: right; font-variant-numeric: tabular-nums; }
+.bar-track { height: 20px; background: #f0f0ee; }
+.bar-fill { display: block; height: 100%; width: var(--value); background: #9aabb4; }
+.bar-row.is-faca .bar-fill { background: #a66120; }
+.bar-row.is-faca .bar-label, .bar-row.is-faca strong { color: #925213; font-weight: 600; }
+.ablation-chart figcaption { margin-top: 19px; }
+.result-details { margin-top: 17px; }
+.result-details summary { cursor: pointer; padding: 10px 0; font: 16px/1.5 var(--sans); text-decoration: underline; text-underline-offset: 4px; }
+.table-scroll { overflow-x: auto; margin-top: 16px; }
+.results-table { width: 100%; border-collapse: collapse; font: 14px/1.5 var(--sans); font-variant-numeric: tabular-nums; text-align: right; }
+.results-table caption { text-align: left; margin-bottom: 10px; color: var(--muted); font-size: 13px; }
+.results-table th, .results-table td { padding: 11px 12px; border-bottom: 1px solid #e9e9e9; white-space: nowrap; }
+.results-table thead th { border-top: 1px solid #aaa; border-bottom: 1px solid #aaa; font-weight: 600; }
+.results-table th:first-child { text-align: left; padding-left: 0; }
+.results-table tbody th { font-weight: 400; }
+.results-table tr.is-faca { background: #faf4e9; }
+.results-table tr.is-faca th { padding-left: 10px; }
+.results-table tr.is-faca th, .results-table tr.is-faca td { font-weight: 600; }
+.metric-note { margin-top: 13px; font-size: 14px; line-height: 1.5; color: var(--muted); }
+.trial-count { font-size: 12px; color: var(--muted); }
 @media (max-width: 650px) {
   body { font-size: 17px; line-height: 1.55; }
   .page { padding: 30px 20px 22px; }
@@ -52,8 +92,24 @@ footer { border-top: 1px solid var(--line); text-align: center; margin-top: 35px
   h2 { font-size: 26px; }
   .video-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 12px; }
   figcaption { font-size: 14px; }
+  .result-highlights { gap: 15px; margin-bottom: 28px; }
+  .result-value { font-size: 34px; }
+  .result-value > span { font-size: 21px; }
+  .result-highlight > strong { font-size: 14px; }
+  .result-highlight > p { font-size: 13px; }
+  .result-block h3 { font-size: 21px; }
+  .ablation-chart { padding: 15px 12px; }
+  .chart-scale { display: none; }
+  .bar-row { grid-template-columns: minmax(0, 1fr) 58px; gap: 6px 10px; }
+  .bar-label { grid-column: 1 / -1; }
+  .bar-row + .bar-row { margin-top: 16px; }
+  .bar-track { height: 17px; }
+  .results-table { font-size: 13px; }
+  .results-table th, .results-table td { padding: 10px; }
 }
 
 @media (max-width: 400px) {
   .video-grid { grid-template-columns: 1fr; }
+  .result-highlights { grid-template-columns: 1fr; gap: 20px; }
+  .result-highlight > p { font-size: 15px; }
 }
