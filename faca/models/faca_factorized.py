@@ -1,4 +1,4 @@
-"""Minimal factorized FACA modules for paper Sec. 3.2 Eq. (5)--(17)."""
+"""FACA contact evidence, recurrent state fusion and auxiliary prediction heads."""
 
 from __future__ import annotations
 

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="FACA: Force-Aware Contact Adaptation for Task-Parameterized Robotic Assembly.">
+  <meta name="theme-color" content="#ffffff">
+  <meta property="og:title" content="FACA: Force-Aware Contact Adaptation">
+  <meta property="og:description" content="A task-conditioned, contact-aware world model for robotic assembly.">
+  <meta property="og:type" content="website">
+  <title>FACA: Force-Aware Contact Adaptation</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/site.css">
+  <script src="assets/site-config.js" defer></script>
+  <script src="assets/site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <main class="page" id="main">
+    <header class="project-header">
+      <h1>FACA: Force-Aware Contact Adaptation<br>for Task-Parameterized Robotic Assembly</h1>
+      <div class="authors" aria-label="Authors">
+        <span>Xing Hu<sup>*</sup></span>
+        <span>Xiangkang Zhao<sup>*</sup></span>
+        <span>Jinxin Liu</span>
+        <span>Runzhe Zhan</span>
+        <span>NaiJin Liu</span>
+      </div>
+      <p class="affiliation">Xi’an Jiaotong University</p>
+      <p class="author-note">* Equal contribution</p>
+      <div class="project-links" aria-label="Project resources">
+        <a href="assets/faca-paper.pdf" data-paper-link target="_blank" rel="noopener">[Paper]</a>
+        <a href="quickstart.md" data-repository-link>[<span data-repository-label>Model</span>]</a>
+        <a href="quickstart.md" data-source-path="docs/quickstart.md">[Documentation]</a>
+      </div>
+    </header>
+
+    <figure class="teaser">
+      <div class="video-stage" data-video-slot="overview" aria-label="Assembly 00062 simulation video">
+        <div class="video-placeholder"><p class="placeholder-status">Simulation video</p></div>
+      </div>
+      <figcaption data-video-title="overview">Assembly 00062 · Clip 01</figcaption>
+    </figure>
+    <noscript><p class="video-note">Enable JavaScript to load the simulation video, or <a href="assets/videos/00062_01.mp4">open the video file</a>.</p></noscript>
+
+    <section class="abstract" aria-label="Abstract">
+      <p><strong>Abstract.</strong> Reliable robotic assembly requires both nominal task knowledge and feedback about execution-dependent contact conditions. We introduce FACA, a task-conditioned, contact-aware world model for parameterized assembly. FACA encodes task descriptors and recent state–action–wrench histories through separate pathways, then integrates them into a recurrent latent state. The model supports prediction and control without future force measurements. Across ten assembly families evaluated at held-out sizes, FACA achieves a success rate of 76.1%, compared with 66.0% for task-conditioned TD-MPC2.</p>
+    </section>
+
+    <section class="method" aria-labelledby="method-title">
+      <h2 id="method-title">Method</h2>
+      <p>The task descriptor supplies a fixed nominal prior, while four steps of interaction history provide online contact evidence. These two pathways update a recurrent latent state that conditions dynamics, reward, value, and the policy prior. Alignment and force-regime supervision shape the contact representation during training.</p>
+      <figure class="architecture">
+        <a href="1.pdf" target="_blank" rel="noopener" aria-label="Open the FACA architecture figure as a PDF"><img src="assets/faca_architecture.png" width="2200" height="1033" alt="FACA architecture: task context and measured state/wrench history update a contact-aware world model for latent-space MPC." loading="lazy"></a>
+        <figcaption>FACA combines nominal task context with measured contact evidence for predictive control.</figcaption>
+      </figure>
+    </section>
+
+    <section class="additional-videos" aria-labelledby="simulation-title" hidden>
+      <h2 id="simulation-title">Simulation</h2>
+      <div class="video-grid" data-video-gallery></div>
+    </section>
+
+    <footer>
+      <p><a href="usage_zh.md" data-source-path="docs/usage_zh.md">中文使用指南</a> · <a href="model_api.md" data-source-path="docs/model_api.md">Model API</a></p>
+    </footer>
+  </main>
+</body>
+</html>

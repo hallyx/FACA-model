@@ -1,41 +1,103 @@
-# FACA model
+# FACA: Force-Aware Contact Adaptation
 
-A model-only extraction of the FACA world model and its task, contact and execution-history encoders. It is derived from FACA archive commit `1574417ec1c352c87e3e1af80edae9b7b6ad235d`; see [PROVENANCE.md](PROVENANCE.md). This repository contains no training pipeline, replay buffer, simulator, planner, trained weights, or experiment data.
+FACA is a task-conditioned, contact-aware world model for robotic assembly. It combines nominal task geometry with recent force–proprioceptive interaction history, updating a recurrent latent state for prediction and action scoring.
 
-## Install and run
+This repository contains FACA's neural models, input utilities and inference interfaces. Start with `FACA`, `FACAConfig` and `InferenceSession`.
 
-Python 3.10+ and a compatible PyTorch installation are required. The CPU smoke tests were run with Python 3.11, PyTorch 2.7.0 and TensorDict 0.11.0. Install PyTorch for your platform, then:
+## Project webpage
+
+The [project page](docs/index.html) presents the method, structure diagram and simulation videos. [网页与视频配置说明](docs/website_zh.md) covers local preview, media updates and GitHub Pages setup. The page uses static HTML, CSS and JavaScript without a frontend build step.
+
+## Getting started
+
+Install PyTorch for your device and use Python 3.10 or newer. The CPU environment used for checks is Python 3.11, PyTorch 2.7.0, TensorDict 0.11.0 and OmegaConf 2.3.
 
 ```bash
-pip install -e '.[test]'
-pytest -q
+python -m pip install -e '.[test]'
+python examples/inference.py
+python -m pytest -q
 ```
 
-The following uses randomly initialized weights and a small demonstration configuration; its outputs are not a usable trained robot policy.
+The example runs synthetic observations through a randomly initialized model. Default output shapes are latent `[2,384]`, action `[2,3]`, alignment `[2,2]` and force-regime logits `[2,3]`.
 
 ```python
 import torch
-from tensordict import TensorDict
-from faca import WorldModel
-from faca.example_config import example_config
+from faca import FACA, InferenceSession, task_descriptor, normalize_wrench
 
-model = WorldModel(example_config('m1')).eval()
-obs = TensorDict({'state': torch.zeros(2, 17), 'wrist_wrench': torch.zeros(2, 6)}, batch_size=[2])
-task = torch.zeros(2, 6)
-history = {'state_history': torch.zeros(2, 4, 14),
-           'force_history': torch.zeros(2, 4, 6),
-           'action_history': torch.zeros(2, 4, 3)}
+model = FACA().eval()
+session = InferenceSession(model, batch_size=2)
+p = task_descriptor(torch.tensor([0, 1]), 7.986, 0.1, 28.616)
+state = torch.zeros(2, 17)
+state[:, 3] = 1.0  # identity quaternion, wxyz
+wrench = normalize_wrench(torch.zeros(2, 6))
+measured = session.observe(state, wrench, p)
+
 with torch.no_grad():
-    z = model.encode(obs, task, history, torch.zeros(2, 16), torch.zeros(2, 3))
-    action, _ = model.pi(z, task)
+    action, _ = model.policy(measured.latent, measured.task_context, deterministic=True)
+    alignment, regime_logits = model.auxiliary(measured)
+    successors, score = model.rollout(
+        measured.latent, action[None].expand(3, -1, -1), measured.task_context)
+
+session.commit_action(action)
 ```
 
-## Observation contract
+Actions are normalized to `[-1,1]`. The controller integration supplies the Cartesian displacement scale and commits the action actually executed. See [Basic usage](docs/quickstart.md) or [中文使用指南](docs/usage_zh.md) for continuous execution, reset handling, candidate scoring and loading matching weights.
 
-The example uses the archived `state_goal_wrench_history_v1` contract: `state` has 14 canonical TCP-state values followed by the 3D goal TCP position in the socket frame. `wrist_wrench` is a separate normalized 6D sensor channel; M1–M3 receive it through the explicitly supplied four-step history, not directly from the current sensor field. The caller must construct correctly aligned histories and previous latent/action inputs. M0 does not use wrench history. This interface differs from the 20D single-frame V3 contract in the main FACA project; checkpoints and observations must not be relabeled or mixed between contracts.
+## Architecture
 
-M2/M3 additionally expose alignment and three-class contact heads. `pi` is a model policy head, not the original TD-MPC2 planning controller. Supplying trained weights, normalization, environment integration and any planning logic is the caller's responsibility. Do not load untrusted PyTorch checkpoints.
+[![FACA architecture: task context, contact-aware world model and latent-space MPC](docs/assets/faca_architecture.png)](docs/1.pdf)
 
-## Release status
+A fixed task descriptor supplies nominal geometry context. Four steps of state, wrist wrench and preceding executed actions supply contact evidence. The recurrent state update fuses both pathways into a latent that supports prediction without future force measurements. Auxiliary alignment and force-regime heads read contact context before latent fusion.
 
-This is a model extraction prepared locally for review, not a published release or a reproduction of training results. Public release still requires the project owner to confirm rights for all contributions and dependencies, select a public hosting location and review any artifacts to be distributed. See [PROVENANCE.md](PROVENANCE.md) and [LICENSE](LICENSE).
+| Module | Default dimensions |
+|---|---|
+| Task encoder | Five-value descriptor → type/metric branches → 64 |
+| Execution history | 104 → 128 → 128 → 64 |
+| Contact encoder | 468 → 128 → 64 |
+| Recurrent state fusion | 532 → 128 → 384 |
+| Dynamics | 451 → 256 → 256 → 384 |
+| Reward / each online critic | 451 → 256 → 256 → 101 |
+| Policy prior | 448 → 256 → 256 → 6 |
+| Alignment / force-regime head | 64 → 128 → 2 / 3 |
+
+The system diagram includes MPC and optional correction-assisted calibration. This release provides the neural components, measured-state updates and candidate scoring primitives; controller integration supplies proposal refinement and hardware execution.
+
+## Model variants
+
+| Variant | State update |
+|---|---|
+| M0 | Current state and static task context |
+| M1 | Direct fusion of execution history and recurrent inputs |
+| M2 | Separate task/contact pathways and auxiliary heads, with auxiliary loss weights zero during learning |
+| M3 | Same inference structure as M2, with contact supervision during learning |
+
+`FACAConfig()` selects M3. Use `FACAConfig(variant='m0')` etc. for other variants. Trainable parameter counts are 1,368,682 (M0), 1,465,130 (M1) and 1,550,703 (M2/M3).
+
+```bash
+python examples/inference.py --variant m0 --batch-size 1
+python examples/inference.py --mode candidates --candidates 8
+python examples/inference.py --device cuda:0
+python -m faca.parameter_audit
+```
+
+The CUDA option requires a working CUDA PyTorch installation. The candidate example scores uniformly sampled three-step sequences; the full iterative MPPI controller is outside this package.
+
+## Documentation
+
+| Guide | Contents |
+|---|---|
+| [Basic usage](docs/quickstart.md) / [中文使用指南](docs/usage_zh.md) | Installation, inputs, execution loop, resets and weights |
+| [Method](docs/method.md) | Task/contact pathways and latent prediction |
+| [Model API](docs/model_api.md) | Tensor layouts, units and output semantics |
+| [Architecture](docs/architecture.md) | Network definitions and version compatibility |
+| [Parameter counts](docs/parameter_counts.md) | Per-module arithmetic and current/legacy model counts |
+
+## Evaluation and release scope
+
+Our held-out-size evaluation covers ten assembly families with 50 seen and 50 held-out conditions. The evaluated variants achieved success rates of 66.0% (M0), 69.0% (M1), 71.8% (M2) and 76.1% (M3). These results correspond to the research evaluation and its checkpoints. Pretrained weights, benchmark assets and training pipelines are not bundled; runnable examples demonstrate the inference interfaces with random weights.
+
+The legacy `WorldModel` interface remains available for existing configurations. Its input and head definitions differ from `FACA`; [version compatibility](docs/architecture.md#version-compatibility) describes the boundaries. Previous import names remain available as aliases.
+
+## License
+
+FACA builds on Newt/TD-MPC2 and preserves the upstream [MIT license](LICENSE). [Development lineage](PROVENANCE.md) records source history and component attribution.
