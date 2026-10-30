@@ -6,7 +6,7 @@ This repository contains FACA's neural models, input utilities and inference int
 
 ## Project webpage
 
-The [project page](docs/index.html) presents the method, structure diagram and simulation videos. [网页与视频配置说明](docs/website_zh.md) covers local preview, media updates and GitHub Pages setup. The page uses static HTML, CSS and JavaScript without a frontend build step.
+The [project page](https://hallyx.github.io/FACA-model/) presents the method, structure diagram and simulation videos.
 
 ## Getting started
 

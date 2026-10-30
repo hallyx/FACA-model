@@ -7,3 +7,7 @@ dist/
 .venv/
 *.pt
 *.pth
+
+# Local website maintenance instructions
+/docs/website*.md
+/docs/assets/videos/README.md
